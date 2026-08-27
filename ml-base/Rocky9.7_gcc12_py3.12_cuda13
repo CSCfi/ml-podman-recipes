@@ -1,0 +1,158 @@
+FROM docker://rockylinux/rockylinux:9.7
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+
+ARG PYVER=3.12
+
+# Enable dnf plugin config-manager, upgrade packages
+# Install basic software from dnf
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf install -y dnf-plugins-core; \
+    dnf config-manager --set-enabled crb; \
+    dnf -y upgrade; \
+    dnf -y install which patch python${PYVER}-devel python${PYVER}-pip \
+    git wget unzip numactl jq diffutils gcc-c++ \
+    # for vim
+    ncurses-devel;
+
+# Packages from EPEL
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+
+# Packages from RPM Fusion, ffmpeg
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm; \
+    dnf -y install ffmpeg
+
+# Set $PYVER default Python, also make "python" and "pip" commands work
+# and upgrade pip
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYVER} 1; \
+    alternatives --install /usr/bin/python python /usr/bin/python3 1; \
+    alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip${PYVER} 1; \
+    alternatives --install /usr/bin/pip pip /usr/bin/pip3 1; \
+    alternatives --install /usr/bin/python3-config python3-config /usr/bin/python${PYVER}-config 1; \
+    alternatives --install /usr/bin/python-config python-config /usr/bin/python3-config 1; \
+    pip install --upgrade pip
+
+# This is a hack to make sure that /usr/local/lib* paths are always
+# included, even with PYTHONNOUSERSITE="TRUE" set
+
+RUN set -ue; \
+    echo "/usr/local/lib/python${PYVER}/site-packages" > /usr/lib/python${PYVER}/site-packages/usr-local.pth; \
+    echo "/usr/local/lib64/python${PYVER}/site-packages" >> /usr/lib/python${PYVER}/site-packages/usr-local.pth
+
+ENV CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++
+
+#############################################################################
+# VIM that works with PYVER Python
+#############################################################################
+
+# Vim - curl -s "https://api.github.com/repos/vim/vim/tags?per_page=1" | jq -r '.[0].name'
+ARG VIMVER=v9.1.1997
+
+# It has to be done like this as default vim-enhanced is compiled
+# against system python
+
+RUN set -ue; \
+    wget -nv https://github.com/vim/vim/archive/refs/tags/${VIMVER}.tar.gz; \
+    tar xf ${VIMVER}.tar.gz; \
+    cd vim-${VIMVER/v/}; \
+    ./configure --enable-python3interp=yes --prefix=/opt/vim --enable-fail-if-missing; \
+    make -j; \
+    make install; \
+    cd; \
+    rm -rf /opt/vim-${VIMVER/v/} /opt/${VIMVER}.tar.gz
+
+ENV PATH=/opt/vim/bin:$PATH
+
+
+#############################################################################
+# MPI and Mellanox
+#############################################################################
+
+#ARG CPU_ARCH=x86_64
+ARG CPU_ARCH=sbsa-arm64
+ARG DOCA_VERSION=3.2.0
+
+# OpenMPI version has to be set manually in order to set ENV later,
+# due to a limitation in Dockerfiles
+ARG OPENMPI_VERSION=4.1.9a1
+
+# Install Mellanox stuff and OpenMPI
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    wget -nv https://www.mellanox.com/downloads/ofed/RPM-GPG-KEY-Mellanox-SHA256; \
+    rpm --import RPM-GPG-KEY-Mellanox-SHA256; \
+    rm RPM-GPG-KEY-Mellanox-SHA256; \
+    echo -e "[doca]\nname=DOCA Online Repo\nbaseurl=https://linux.mellanox.com/public/repo/doca/${DOCA_VERSION}/rhel9/${CPU_ARCH}/\nenabled=1\ngpgkey=https://linux.mellanox.com/public/repo/doca/${DOCA_VERSION}/rhel9/${CPU_ARCH}/GPG-KEY-Mellanox.pub\ngpgcheck=1" > /etc/yum.repos.d/doca.repo; \
+    #OPENMPI_PACKAGE=$(dnf --repo doca* whatprovides openmpi | grep -B 1 doca| grep -v Repo |  awk '{print $1;}' | sort | tail -n 1); \
+    RDMACORE_PACKAGE=$(dnf --repo doca* whatprovides rdma-core | grep -B 1 doca | grep -v Repo |  awk '{print $1;}' | sort | tail -n 1); \
+    UCXIB_PACKAGE=$(dnf --repo doca* whatprovides ucx-ib | grep -B 1 doca | grep -v Repo |  awk '{print $1;}' | sort | tail -n 1); \
+    dnf -y install openmpi-${OPENMPI_VERSION} ${RDMACORE_PACKAGE} ${UCXIB_PACKAGE}
+
+ENV OPENMPI_INSTROOT=/usr/mpi/gcc/openmpi-${OPENMPI_VERSION}
+
+ENV PATH=${OPENMPI_INSTROOT}/bin:$PATH \
+    LD_LIBRARY_PATH=${OPENMPI_INSTROOT}/lib64:$LD_LIBRARY_PATH \
+    LIBRARY_PATH=${OPENMPI_INSTROOT}/lib64:$LIBRARY_PATH \
+    CMAKE_PREFIX_PATH=${OPENMPI_INSTROOT}:$CMAKE_PREFIX_PATH \
+    CPATH=${OPENMPI_INSTROOT}/include:$CPATH
+
+ENV MPICC=${OPENMPI_INSTROOT}/bin/mpicc \
+    MPICXX=${OPENMPI_INSTROOT}/bin/mpic++
+
+
+#############################################################################
+# CUDA
+#############################################################################
+
+# Versions for NVIDIA and CUDA packages
+ARG NVIDIA_DRIVER=590
+ARG CUDA_VERSION=13.0
+ARG CUDNN_VERSION=9
+ARG CUDNN_EXACT_VERSION=9.16.0.29-1
+ARG NCCL_VERSION=2.28.9-1
+ARG CPU_ARCH_CUDA=sbsa
+
+# Set up repository for NVIDIA CUDA
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/${CPU_ARCH_CUDA}/cuda-rhel9.repo;
+
+# Install NVIDIA driver
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf module install -y nvidia-driver:${NVIDIA_DRIVER}-open;
+
+# Install CUDA, CUDNN, NCCL
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf -y install cuda-${CUDA_VERSION/./-} \
+    libcudnn${CUDNN_VERSION}{,-devel}-cuda-${CUDA_VERSION/.*/}-${CUDNN_EXACT_VERSION} \
+    libcusparselt0 \
+    libnccl{,-devel,-static}-${NCCL_VERSION}+cuda${CUDA_VERSION} \
+    libnvshmem3-cuda-${CUDA_VERSION/.*/}
+
+# Settings for compiling stuff with CUDA
+ENV CUDA_HOME=/usr/local/cuda
+
+ENV PATH=${CUDA_HOME}/bin:$PATH \
+    LD_LIBRARY_PATH=${CUDA_HOME}/lib64:$LD_LIBRARY_PATH \
+    LIBRARY_PATH=${CUDA_HOME}/lib64:$LIBRARY_PATH \
+    CMAKE_PREFIX_PATH=${CUDA_HOME}:$CMAKE_PREFIX_PATH \
+    CPATH=${CUDA_HOME}/include:$CPATH
+
+
+#############################################################################
+# Add "SBOM" - a list of all packages and versions
+#############################################################################
+
+RUN set -ue; \
+    RPM_JSON=$(rpm -qa --queryformat '%{NAME}\t%{VERSION}\n' | jq -R -s 'split("\n")[:-1] | map(split("\t") | {name: .[0], version: .[1]})'); \
+    jq -n --argjson rpm "$RPM_JSON" '{rpm: $rpm}' > /.sbom.json

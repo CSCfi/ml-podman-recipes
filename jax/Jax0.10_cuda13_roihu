@@ -1,0 +1,54 @@
+FROM localhost/ml-base:rocky9.7_gcc12_py3.12_cuda13
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+
+# JAX versions
+ARG JAX_VERSION=0.10.2
+ARG NODEJS_VERSION=24
+
+ARG CMAKE_CUDA_ARCHITECTURES=90
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    # sqlite-devel needed by pysqlite3
+    dnf -y install sqlite-devel cmake
+
+COPY requirements_jax_0.10.txt requirements.txt
+
+# Install Python packages, including JAX
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    pip install wheel ninja setuptools cython mpi4py nanobind; \
+    pip install --no-build-isolation jax[cuda13-local] \
+    tensorflow tensorflow_datasets \
+    -r /opt/requirements.txt; \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install mpi4jax
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    git clone https://github.com/mpi4jax/mpi4jax; \
+    cd mpi4jax; \
+    # specific commit that is compatible with JAX 0.10.2
+    git checkout 84fa23b; \
+    CUDA_ROOT=/usr/local/cuda pip install . --no-build-isolation; \
+    cd /opt; \
+    rm -rf mpi4jax
+
+# Jupyter, including newer nodejs (req. >= 20.0.0)
+# - nodejs versions can be listed with "dnf module list nodejs"
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf module -y install nodejs:${NODEJS_VERSION}/common; \
+    pip install jupyterlab-dash; \
+    /usr/local/bin/jupyter lab build
+
+#############################################################################
+# Add "SBOM" - a list of all packages and versions
+#############################################################################
+
+RUN set -ue; \
+    RPM_JSON="$(rpm -qa --queryformat '%{NAME}\t%{VERSION}\n' | jq -R -s 'split("\n")[:-1] | map(split("\t") | {name: .[0], version: .[1]})')"; \
+    PIP_JSON="$(pip list --format=json)"; \
+    jq -n --argjson rpm "$RPM_JSON"  --argjson pip "$PIP_JSON" '{rpm: $rpm, pip: $pip}' > /.sbom.json;

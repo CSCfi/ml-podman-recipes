@@ -1,0 +1,128 @@
+FROM localhost/pytorch-base:2.10_cuda13_roihu
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+  
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+ARG CMAKE_CUDA_ARCHITECTURES="90"
+
+#ARG MAX_JOBS=4
+#ARG NVCC_THREADS=2
+
+#############################################################################
+# xFormers
+#############################################################################
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+   set -ue; \
+   pip install --no-build-isolation --verbose xformers==v0.0.35
+
+
+#############################################################################
+# OpenCV + ffcv
+#############################################################################
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf -y install opencv opencv-devel turbojpeg turbojpeg-devel; \
+    pip install --verbose ffcv
+
+
+#############################################################################
+# PyTorch geometric and related libraries
+#############################################################################
+
+ARG CPATH=/usr/local/cuda/include
+ARG FORCE_CUDA=1
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    pip install --no-build-isolation git+https://github.com/pyg-team/pyg-lib.git; \
+    pip install --no-build-isolation torch_scatter; \
+    pip install --no-build-isolation torch_sparse; \
+    pip install --no-build-isolation torch_cluster; \
+    pip install --no-build-isolation torch_spline_conv
+
+
+#############################################################################
+# DeepSpeed
+#############################################################################
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf -y install libaio-devel; \
+    pip install --no-build-isolation deepspeed
+
+
+#############################################################################
+# FAISS
+#############################################################################
+
+ARG FAISS_VERSION=1.14.1
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf -y install swig gflags-devel openblas-devel; \
+    cd /opt; \
+    git clone --branch v$FAISS_VERSION https://github.com/facebookresearch/faiss; \
+    cd faiss; \
+    cmake -B build . -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON \
+    -DBUILD_TESTING=OFF -DFAISS_OPT_LEVEL=generic -DFAISS_ENABLE_C_API=ON \
+    -DBUILD_SHARED_LIBS=ON -DCMAKE_CUDA_ARCHITECTURES=$CMAKE_CUDA_ARCHITECTURES -DCMAKE_BUILD_TYPE=Release; \
+    make -C build -j10 faiss; \
+    make -C build swigfaiss; \
+    cd build/faiss/python; \
+    pip install .; \
+    cd /opt/faiss; \
+    make -C build install; \
+    cd /opt; \
+    rm -rf faiss
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/faiss/:/usr/local/lib64/:$LD_LIBRARY_PATH
+
+
+#############################################################################
+# Flash attention
+#############################################################################
+
+RUN --mount=type=cache,target=/root/.cache/pip \ 
+    set -ue; \
+    MAX_JOBS=4 FLASH_ATTN_CUDA_ARCHS=${CMAKE_CUDA_ARCHITECTURES} \
+    pip install --no-build-isolation --verbose flash-attn
+
+
+#############################################################################
+# Transformer Engine
+#############################################################################
+
+RUN --mount=type=cache,target=/root/.cache/pip \ 
+    set -ue; \
+    NVTE_BUILD_THREADS=4 \
+    MAX_JOBS=10 \
+    NVTE_FRAMEWORK=pytorch \
+    NVTE_CUDA_ARCHS="90" \
+    pip install --no-build-isolation --verbose git+https://github.com/NVIDIA/TransformerEngine.git@stable
+
+
+#############################################################################
+# apex -- deprecated, but apparently still needed by Megatron-LM
+#############################################################################
+
+RUN --mount=type=cache,target=/root/.cache/pip \ 
+    set -ue; \
+    APEX_CPP_EXT=1 \
+    APEX_CUDA_EXT=1 \
+    NVCC_APPEND_FLAGS="--threads 4" \
+    pip install --no-build-isolation --verbose git+https://github.com/NVIDIA/apex@0857d7b
+
+
+#############################################################################
+# Add "SBOM" - a list of all packages and versions
+#############################################################################
+
+RUN set -ue; \
+    RPM_JSON="$(rpm -qa --queryformat '%{NAME}\t%{VERSION}\n' | jq -R -s 'split("\n")[:-1] | map(split("\t") | {name: .[0], version: .[1]})')"; \
+    PIP_JSON="$(pip list --format=json)"; \
+    jq -n --argjson rpm "$RPM_JSON"  --argjson pip "$PIP_JSON" '{rpm: $rpm, pip: $pip}' > /.sbom.json;

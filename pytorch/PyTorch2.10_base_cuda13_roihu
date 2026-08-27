@@ -1,0 +1,70 @@
+FROM localhost/ml-base:rocky9.7_gcc12_py3.12_cuda13
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+
+#############################################################################
+# PyTorch and python packages from pip
+#############################################################################
+
+# PyTorch versions
+ARG PYTORCH_VERSION=2.10.0
+ARG PYTORCH_CUDA_VERSION=130
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG NODEJS_VERSION=24
+
+# Roihu
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+ARG CMAKE_CUDA_ARCHITECTURES=90
+
+ENV KERAS_BACKEND="torch"
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    # sqlite-devel needed by pysqlite3
+    dnf -y install sqlite-devel #openssl-devel libxml2-devel libxslt-devel
+
+COPY requirements_pytorch_2.10.txt requirements.txt
+
+# Install Python packages, including PyTorch
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    pip install wheel ninja setuptools setuptools_rust cython numpy; \
+    pip install --no-build-isolation torch==${PYTORCH_VERSION} \
+    torchvision==${TORCHVISION_VERSION} \
+    torchaudio==${TORCHAUDIO_VERSION} \
+    --extra-index-url https://download.pytorch.org/whl/cu${PYTORCH_CUDA_VERSION} \
+    -r /opt/requirements.txt; \
+    # For some reason bitsandbytes needs to be re-installed, otherwise
+    # we get non-GPU version
+    pip install --no-build-isolation --force-reinstall --no-deps bitsandbytes
+
+# Jupyter, including newer nodejs (req. >= 20.0.0)
+# - nodejs versions can be listed with "dnf module list nodejs"
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf module -y install nodejs:${NODEJS_VERSION}/common; \
+    pip install jupyterlab-dash; \
+    /usr/local/bin/jupyter lab build
+
+# Fix issue that torch is in lib64 but nvidia packages in lib,
+# causing rpaths to not work
+RUN set -ue; \
+    PYVER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"); \
+    if [ -d /usr/local/lib/python${PYVER}/site-packages/nvidia -a \
+      -d /usr/local/lib64/python${PYVER}/site-packages/torch ]; \
+    then \
+      cd /usr/local/lib64/python${PYVER}/site-packages/; \
+      ln -s /usr/local/lib/python${PYVER}/site-packages/nvidia .; \
+    fi
+
+
+#############################################################################
+# Add "SBOM" - a list of all packages and versions
+#############################################################################
+
+RUN set -ue; \
+    RPM_JSON="$(rpm -qa --queryformat '%{NAME}\t%{VERSION}\n' | jq -R -s 'split("\n")[:-1] | map(split("\t") | {name: .[0], version: .[1]})')"; \
+    PIP_JSON="$(pip list --format=json)"; \
+    jq -n --argjson rpm "$RPM_JSON"  --argjson pip "$PIP_JSON" '{rpm: $rpm, pip: $pip}' > /.sbom.json;

@@ -1,0 +1,108 @@
+FROM localhost/ml-base:rocky9.7_gcc12_py3.12_cuda12.9_cudnn930 as builder
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+
+#############################################################################
+# Build stage
+# - Installs llvm, bazel and builds TensorFlow with bazel
+# - Only the resulting wheel will be kept for the final image
+#############################################################################
+
+ARG TENSORFLOW_VERSION=2.21.0
+ARG CLANG_VER=17.0.2
+ARG CLANG_ARCH="aarch64-linux-gnu"
+ARG CMAKE_CUDA_ARCHITECTURES=90
+
+# Install llvm, clang
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    dnf -y install xz; \
+    export CLANG_TAR=clang+llvm-${CLANG_VER}-${CLANG_ARCH}.tar.xz; \
+    wget -nv https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VER}/${CLANG_TAR}; \
+    tar xf ${CLANG_TAR}; \
+    rm ${CLANG_TAR}
+
+# Install bazel
+RUN set -ue; \
+    mkdir bazel; \
+    cd bazel; \
+    wget -nv https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-arm64 -O bazel; \
+    chmod +x bazel
+
+ENV PATH=/opt/bazel:$PATH
+
+# Clone tensorflow
+RUN set -ue; \
+    git clone https://github.com/tensorflow/tensorflow.git -b v${TENSORFLOW_VERSION}
+
+COPY tf_configure_bazel_cuda.bazelrc tensorflow/.tf_configure.bazelrc
+COPY python_bin_path.sh tensorflow/tools/python_bin_path.sh
+
+RUN set -eu; \
+    cd /opt/tensorflow; \
+    bazel build //tensorflow/tools/pip_package:wheel \
+    --repo_env=HERMETIC_PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info[0], sys.version_info[1], sep='.')")\
+    --repo_env=USE_PYWRAP_RULES=1 \
+    --repo_env=WHEEL_NAME=tensorflow \
+    --config=cuda --config=cuda_wheel
+
+
+# Actual TensorFlow installation stage
+# - Copies wheel from the build stage, throwing the rest away
+
+FROM localhost/ml-base:rocky9.7_gcc12_py3.12_cuda12.9_cudnn930
+MAINTAINER Mats Sjöberg <mats.sjoberg@csc.fi>
+WORKDIR /opt
+
+# TensorFlow versions
+ARG TENSORFLOW_VERSION=2.21.0
+ARG NODEJS_VERSION=24
+
+ARG CMAKE_CUDA_ARCHITECTURES=90
+ENV KERAS_BACKEND="tensorflow"
+
+RUN --mount=type=cache,target=/var/cache/dnf \
+    set -ue; \
+    # sqlite-devel needed by pysqlite3
+    dnf -y install sqlite-devel cmake; \
+    mkdir wheels
+
+ARG TF_WHEELFILE=tensorflow-${TENSORFLOW_VERSION}-cp312-cp312-linux_aarch64.whl
+
+COPY requirements_tensorflow_2.21.txt requirements.txt
+COPY --from=builder /opt/tensorflow/bazel-bin/tensorflow/tools/pip_package/wheel_house/* /opt/wheels/
+
+# Install Python packages, including TensorFlow
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    pip install wheel ninja setuptools cython; \
+    pip install --no-build-isolation /opt/wheels/${TF_WHEELFILE} \
+    -r /opt/requirements.txt; \
+    rm /opt/wheels/${TF_WHEELFILE}
+
+# Jupyter, including newer nodejs (req. >= 20.0.0)
+# - nodejs versions can be listed with "dnf module list nodejs"
+RUN --mount=type=cache,target=/var/cache/dnf \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -ue; \
+    dnf module -y install nodejs:${NODEJS_VERSION}/common; \
+    pip install jupyterlab-dash; \
+    /usr/local/bin/jupyter lab build
+
+# Horovod
+#RUN --mount=type=cache,target=/root/.cache/pip \
+#    set -ue; \
+#    HOROVOD_WITHOUT_PYTORCH=1 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITHOUT_MXNET=1 \
+#      HOROVOD_WITH_MPI=1 HOROVOD_WITHOUT_GLOO=1 \
+#      HOROVOD_GPU_OPERATIONS=NCCL HOROVOD_NCCL_LINK=SHARED \
+#      pip install --no-build-isolation horovod
+
+
+#############################################################################
+# Add "SBOM" - a list of all packages and versions
+#############################################################################
+
+RUN set -ue; \
+    RPM_JSON="$(rpm -qa --queryformat '%{NAME}\t%{VERSION}\n' | jq -R -s 'split("\n")[:-1] | map(split("\t") | {name: .[0], version: .[1]})')"; \
+    PIP_JSON="$(pip list --format=json)"; \
+    jq -n --argjson rpm "$RPM_JSON"  --argjson pip "$PIP_JSON" '{rpm: $rpm, pip: $pip}' > /.sbom.json;
