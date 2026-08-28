@@ -97,6 +97,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Transformer Engine
 #############################################################################
 
+# It seems to need the slightly newer cudnn coming with PyTorch 2.13
+# cudnn 9.20 vs 9.16 from ml-base
+ENV LD_LIBRARY_PATH=/usr/local/lib64/python3.12/site-packages/nvidia/cudnn/lib/:$LD_LIBRARY_PATH
+
 RUN --mount=type=cache,target=/root/.cache/pip \ 
     set -ue; \
     pip install nvidia-cudnn-frontend; \
