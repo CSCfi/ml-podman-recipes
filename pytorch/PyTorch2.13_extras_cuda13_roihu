@@ -124,6 +124,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 
 #############################################################################
+# Fixes for terratorch
+#############################################################################
+# **FIXME**These were applied interactively later...
+#
+# RUN --mount=type=cache,target=/root/.cache/pip \ 
+#     set -ue; \
+#     pip install torchgeo=0.9.0 kernels
+
+
+#############################################################################
 # Add "SBOM" - a list of all packages and versions
 #############################################################################
 
